@@ -1,5 +1,7 @@
 import json
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from typing import List, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -7,22 +9,47 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Initialisation de la base de données SQLite permanente
-def get_db():
-    conn = sqlite3.connect("services.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# URL de la base PostgreSQL fournie par Render
+# Si DATABASE_URL n'est pas encore définie, il utilise SQLite temporairement
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-with get_db() as conn:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_services (
-            date_str TEXT PRIMARY KEY,
-            shifts_json TEXT,
-            repos_text TEXT,
-            changes_text TEXT
-        )
-    """)
+def get_connection():
+    if DATABASE_URL:
+        # Corrige le préfixe si Render fournit postgres:// au lieu de postgresql://
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url)
+        return conn
+    else:
+        import sqlite3
+        conn = sqlite3.connect("services.db", check_same_thread=False)
+        return conn
+
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_services (
+                date_str VARCHAR(20) PRIMARY KEY,
+                shifts_json TEXT,
+                repos_text TEXT,
+                changes_text TEXT
+            );
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_services (
+                date_str TEXT PRIMARY KEY,
+                shifts_json TEXT,
+                repos_text TEXT,
+                changes_text TEXT
+            );
+        """)
     conn.commit()
+    cur.close()
+    conn.close()
+
+init_db()
 
 class ShiftData(BaseModel):
     date: str
@@ -62,28 +89,45 @@ async def ws_endpoint(websocket: WebSocket):
 
 @app.get("/api/day/{date_str}")
 def get_day(date_str: str):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM daily_services WHERE date_str = ?", (date_str,)).fetchone()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT shifts_json, repos_text, changes_text FROM daily_services WHERE date_str = %s" if DATABASE_URL else "SELECT shifts_json, repos_text, changes_text FROM daily_services WHERE date_str = ?", (date_str,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
     if row:
         return {
-            "shifts": json.loads(row["shifts_json"]),
-            "repos": row["repos_text"],
-            "changes": row["changes_text"]
+            "shifts": json.loads(row[0]),
+            "repos": row[1] or "",
+            "changes": row[2] or ""
         }
     return {"shifts": {}, "repos": "", "changes": ""}
 
 @app.post("/api/save")
 async def save_day(payload: ShiftData):
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO daily_services (date_str, shifts_json, repos_text, changes_text)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(date_str) DO UPDATE SET
-            shifts_json = excluded.shifts_json,
-            repos_text = excluded.repos_text,
-            changes_text = excluded.changes_text
-    """, (payload.date, json.dumps(payload.shifts), payload.repos, payload.changes))
+    conn = get_connection()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute("""
+            INSERT INTO daily_services (date_str, shifts_json, repos_text, changes_text)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (date_str) DO UPDATE SET
+                shifts_json = EXCLUDED.shifts_json,
+                repos_text = EXCLUDED.repos_text,
+                changes_text = EXCLUDED.changes_text;
+        """, (payload.date, json.dumps(payload.shifts), payload.repos, payload.changes))
+    else:
+        cur.execute("""
+            INSERT INTO daily_services (date_str, shifts_json, repos_text, changes_text)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(date_str) DO UPDATE SET
+                shifts_json = excluded.shifts_json,
+                repos_text = excluded.repos_text,
+                changes_text = excluded.changes_text;
+        """, (payload.date, json.dumps(payload.shifts), payload.repos, payload.changes))
     conn.commit()
+    cur.close()
+    conn.close()
 
     await manager.broadcast({
         "date": payload.date,
@@ -109,23 +153,20 @@ def serve_index():
     <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-wrap justify-between items-center gap-3">
       <div>
         <h1 class="text-lg font-bold text-slate-900">Service Contrôle</h1>
-        <p class="text-xs text-slate-500">Mise à jour en temps réel</p>
+        <p class="text-xs text-slate-500">Mise à jour en temps réel & Sauvegarde permanente</p>
       </div>
       <div class="flex items-center gap-3">
         <input type="date" id="selectedDate" class="border rounded-lg px-3 py-1.5 font-medium bg-slate-50 border-slate-300 text-sm">
-        <span id="badge" class="px-2 py-1 text-xs rounded-full bg-emerald-100 text-emerald-700 font-semibold">Connecté</span>
+        <span id="badge" class="px-2 py-1 text-xs rounded-full bg-emerald-100 text-emerald-700 font-semibold">En direct</span>
       </div>
     </div>
 
     <!-- Grille des shifts -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <!-- Matin -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
         <h2 class="font-bold text-amber-700 text-sm border-b pb-2 mb-3">Postes Matin</h2>
         <div id="morningInputs" class="space-y-2"></div>
       </div>
-
-      <!-- Après-midi -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
         <h2 class="font-bold text-indigo-700 text-sm border-b pb-2 mb-3">Postes Après-midi</h2>
         <div id="afternoonInputs" class="space-y-2"></div>
@@ -200,7 +241,6 @@ def serve_index():
 
     datePicker.addEventListener("change", loadData);
 
-    // WebSocket temps réel
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
     ws.onmessage = (e) => {
