@@ -1,61 +1,50 @@
+
 import json
-import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
+import re
 from typing import List, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI()
 
-# URL de la base PostgreSQL fournie par Render
-# Si DATABASE_URL n'est pas encore définie, il utilise SQLite temporairement
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
-def get_connection():
-    if DATABASE_URL:
-        # Corrige le préfixe si Render fournit postgres:// au lieu de postgresql://
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        conn = psycopg2.connect(url)
-        return conn
-    else:
-        import sqlite3
-        conn = sqlite3.connect("services.db", check_same_thread=False)
-        return conn
+# Initialisation de la base de données SQLite
+def get_db():
+    conn = sqlite3.connect("services.db", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def init_db():
-    conn = get_connection()
-    cur = conn.cursor()
-    if DATABASE_URL:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_services (
-                date_str VARCHAR(20) PRIMARY KEY,
-                shifts_json TEXT,
-                repos_text TEXT,
-                changes_text TEXT
-            );
-        """)
-    else:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS daily_services (
-                date_str TEXT PRIMARY KEY,
-                shifts_json TEXT,
-                repos_text TEXT,
-                changes_text TEXT
-            );
-        """)
+
+with get_db() as conn:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_services (
+            date_str TEXT PRIMARY KEY,
+            shifts_json TEXT,
+            repos_text TEXT,
+            changes_text TEXT
+        )
+    """)
     conn.commit()
-    cur.close()
-    conn.close()
 
-init_db()
 
-class ShiftData(BaseModel):
-    date: str
-    shifts: Dict[str, str]
-    repos: str
-    changes: str
+SLOT_RE = re.compile(r"^[A-Z][0-9]{1,2}$")
+
+
+class FieldPatch(BaseModel):
+    """Modification d'UN seul champ (une case, 'repos' ou 'changes')."""
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    field: str
+    value: str = Field(default="", max_length=2000)
+
+    @field_validator("field")
+    @classmethod
+    def check_field(cls, v):
+        if v in ("repos", "changes") or SLOT_RE.match(v):
+            return v
+        raise ValueError("champ inconnu")
+
 
 class ConnectionManager:
     def __init__(self):
@@ -76,7 +65,9 @@ class ConnectionManager:
             except Exception:
                 self.disconnect(connection)
 
+
 manager = ConnectionManager()
+
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
@@ -87,55 +78,71 @@ async def ws_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+
 @app.get("/api/day/{date_str}")
 def get_day(date_str: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT shifts_json, repos_text, changes_text FROM daily_services WHERE date_str = %s" if DATABASE_URL else "SELECT shifts_json, repos_text, changes_text FROM daily_services WHERE date_str = ?", (date_str,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row:
-        return {
-            "shifts": json.loads(row[0]),
-            "repos": row[1] or "",
-            "changes": row[2] or ""
-        }
-    return {"shifts": {}, "repos": "", "changes": ""}
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM daily_services WHERE date_str = ?",
+            (date_str,)
+        ).fetchone()
 
-@app.post("/api/save")
-async def save_day(payload: ShiftData):
-    conn = get_connection()
-    cur = conn.cursor()
-    if DATABASE_URL:
-        cur.execute("""
-            INSERT INTO daily_services (date_str, shifts_json, repos_text, changes_text)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (date_str) DO UPDATE SET
-                shifts_json = EXCLUDED.shifts_json,
-                repos_text = EXCLUDED.repos_text,
-                changes_text = EXCLUDED.changes_text;
-        """, (payload.date, json.dumps(payload.shifts), payload.repos, payload.changes))
-    else:
-        cur.execute("""
-            INSERT INTO daily_services (date_str, shifts_json, repos_text, changes_text)
+        if row:
+            return {
+                "shifts": json.loads(row["shifts_json"]),
+                "repos": row["repos_text"],
+                "changes": row["changes_text"]
+            }
+
+        return {"shifts": {}, "repos": "", "changes": ""}
+    finally:
+        conn.close()
+
+
+@app.post("/api/patch")
+async def patch_field(p: FieldPatch):
+    conn = get_db()
+    try:
+        # Verrou d'écriture : lecture + fusion + écriture atomiques
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM daily_services WHERE date_str = ?", (p.date,)
+        ).fetchone()
+
+        shifts = json.loads(row["shifts_json"]) if row else {}
+        repos = row["repos_text"] if row else ""
+        changes = row["changes_text"] if row else ""
+
+        if p.field == "repos":
+            repos = p.value
+        elif p.field == "changes":
+            changes = p.value
+        elif p.value.strip():
+            shifts[p.field] = p.value.strip()
+        else:
+            shifts.pop(p.field, None)
+
+        conn.execute("""
+            INSERT INTO daily_services
+                (date_str, shifts_json, repos_text, changes_text)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(date_str) DO UPDATE SET
                 shifts_json = excluded.shifts_json,
                 repos_text = excluded.repos_text,
-                changes_text = excluded.changes_text;
-        """, (payload.date, json.dumps(payload.shifts), payload.repos, payload.changes))
-    conn.commit()
-    cur.close()
-    conn.close()
+                changes_text = excluded.changes_text
+        """, (p.date, json.dumps(shifts), repos, changes))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    await manager.broadcast({
-        "date": payload.date,
-        "shifts": payload.shifts,
-        "repos": payload.repos,
-        "changes": payload.changes
-    })
+    # On ne diffuse que le champ modifié
+    await manager.broadcast({"date": p.date, "field": p.field, "value": p.value})
     return {"status": "ok"}
+
 
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
@@ -147,112 +154,261 @@ def serve_index():
   <title>Service Contrôle - Gestion</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
+
 <body class="bg-slate-100 text-slate-800 p-3 sm:p-6 pb-20">
   <div class="max-w-4xl mx-auto space-y-4">
-    <!-- Header -->
+
+    <!-- En-tête -->
     <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-wrap justify-between items-center gap-3">
       <div>
         <h1 class="text-lg font-bold text-slate-900">Service Contrôle</h1>
-        <p class="text-xs text-slate-500">Mise à jour en temps réel & Sauvegarde permanente</p>
+        <p class="text-xs text-slate-500">Mise à jour en temps réel</p>
       </div>
+
       <div class="flex items-center gap-3">
-        <input type="date" id="selectedDate" class="border rounded-lg px-3 py-1.5 font-medium bg-slate-50 border-slate-300 text-sm">
-        <span id="badge" class="px-2 py-1 text-xs rounded-full bg-emerald-100 text-emerald-700 font-semibold">En direct</span>
+        <input type="date" id="selectedDate"
+          class="border rounded-lg px-3 py-1.5 font-medium bg-slate-50 border-slate-300 text-sm">
+
+        <span id="badge"
+          class="px-2 py-1 text-xs rounded-full bg-emerald-100 text-emerald-700 font-semibold">
+          Connecté
+        </span>
       </div>
     </div>
 
-    <!-- Grille des shifts -->
+    <!-- Postes de service -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+      <!-- Matin -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
-        <h2 class="font-bold text-amber-700 text-sm border-b pb-2 mb-3">Postes Matin</h2>
+        <h2 class="font-bold text-amber-700 text-sm border-b pb-2 mb-3">
+          Postes Matin
+        </h2>
         <div id="morningInputs" class="space-y-2"></div>
       </div>
+
+      <!-- Après-midi -->
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
-        <h2 class="font-bold text-indigo-700 text-sm border-b pb-2 mb-3">Postes Après-midi</h2>
+        <h2 class="font-bold text-indigo-700 text-sm border-b pb-2 mb-3">
+          Postes Après-midi
+        </h2>
         <div id="afternoonInputs" class="space-y-2"></div>
       </div>
+
     </div>
 
-    <!-- Repos & Changements -->
+    <!-- Repos et changements -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
-        <h2 class="font-bold text-slate-700 text-sm border-b pb-2 mb-2">Agents en Repos</h2>
-        <textarea id="repos" rows="4" placeholder="Un nom par ligne..." class="w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500"></textarea>
+        <h2 class="font-bold text-slate-700 text-sm border-b pb-2 mb-2">
+          Agents en Repos
+        </h2>
+
+        <textarea id="repos" rows="4"
+          placeholder="Un nom par ligne..."
+          class="w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500"></textarea>
       </div>
+
       <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
-        <h2 class="font-bold text-rose-700 text-sm border-b pb-2 mb-2">Changements de service</h2>
-        <textarea id="changes" rows="4" placeholder="Ex: COSENTINO E4 -> MAELLE P6" class="w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500"></textarea>
+        <h2 class="font-bold text-rose-700 text-sm border-b pb-2 mb-2">
+          Changements de service
+        </h2>
+
+        <textarea id="changes" rows="4"
+          placeholder="Ex: COSENTINO E4 -> MAELLE P6"
+          class="w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500"></textarea>
       </div>
+
     </div>
+
+    <!-- Disclaimer -->
+    <footer class="mt-6 rounded-xl border border-slate-200 bg-white p-4 text-center text-xs text-slate-500 shadow-sm">
+      <p class="font-semibold text-slate-700">
+        Information et responsabilité
+      </p>
+
+      <p class="mt-2 leading-relaxed">
+        L’utilisateur de cette application consent à partager ses données.
+        Celles-ci sont exclusivement destinées aux besoins du Service Contrôle.
+        Tout abus entraînera la suspension, voire la fermeture du service.
+      </p>
+    </footer>
+
   </div>
 
   <script>
-    const morningSlots = ["R1", "R3", "R5", "M1", "M3", "M5", "M7", "E1", "E3", "E5", "P1", "P3", "P5", "F1", "F3", "F5"];
-    const afternoonSlots = ["R2", "R4", "R6", "M2", "M4", "M6", "M8", "E2", "E4", "E6", "P2", "P4", "P6", "F2", "F4", "F6"];
+    const morningSlots = [
+      "R1", "R3", "R5",
+      "M1", "M3", "M5", "M7",
+      "E1", "E3", "E5",
+      "P1", "P3", "P5",
+      "F1", "F3", "F5"
+    ];
+
+    const afternoonSlots = [
+      "R2", "R4", "R6",
+      "M2", "M4", "M6", "M8",
+      "E2", "E4", "E6",
+      "P2", "P4", "P6",
+      "F2", "F4", "F6"
+    ];
+
     const datePicker = document.getElementById("selectedDate");
     const reposBox = document.getElementById("repos");
     const changesBox = document.getElementById("changes");
+    const badge = document.getElementById("badge");
 
     function renderSlots(containerId, slots) {
-      document.getElementById(containerId).innerHTML = slots.map(s => `
-        <div class="flex items-center gap-2">
-          <span class="w-8 text-xs font-bold text-slate-500">${s}</span>
-          <input type="text" data-slot="${s}" class="slot-input flex-1 border border-slate-200 rounded px-2 py-1 text-sm bg-slate-50 focus:bg-white focus:border-blue-500 outline-none" placeholder="Nom de l'agent">
-        </div>
-      `).join('');
+      document.getElementById(containerId).innerHTML =
+        slots.map(s => `
+          <div class="flex items-center gap-2">
+            <span class="w-8 text-xs font-bold text-slate-500">${s}</span>
+            <input
+              type="text"
+              data-slot="${s}"
+              class="slot-input flex-1 border border-slate-200 rounded px-2 py-1 text-sm bg-slate-50 focus:bg-white focus:border-blue-500 outline-none"
+              placeholder="Nom de l'agent"
+            >
+          </div>
+        `).join("");
     }
+
     renderSlots("morningInputs", morningSlots);
     renderSlots("afternoonInputs", afternoonSlots);
 
-    datePicker.value = new Date().toISOString().split('T')[0];
+    // Date locale, sans décalage lié au fuseau horaire
+    function getLocalDate() {
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const day = String(now.getDate()).padStart(2, "0");
 
-    async function loadData() {
-      const res = await fetch(`/api/day/${datePicker.value}`);
-      const data = await res.json();
-      document.querySelectorAll(".slot-input").forEach(i => i.value = data.shifts[i.dataset.slot] || "");
-      reposBox.value = data.repos || "";
-      changesBox.value = data.changes || "";
+      return `${year}-${month}-${day}`;
     }
 
-    let saveTimer;
-    function triggerAutoSave() {
-      clearTimeout(saveTimer);
-      saveTimer = setTimeout(async () => {
-        const shifts = {};
-        document.querySelectorAll(".slot-input").forEach(i => {
-          if (i.value.trim()) shifts[i.dataset.slot] = i.value.trim();
+    datePicker.value = getLocalDate();
+
+    let loadingData = false;
+
+    async function loadData() {
+      loadingData = true;
+
+      try {
+        const res = await fetch(
+          `/api/day/${encodeURIComponent(datePicker.value)}`
+        );
+
+        if (!res.ok) {
+          throw new Error("Erreur lors du chargement");
+        }
+
+        const data = await res.json();
+
+        document.querySelectorAll(".slot-input").forEach(input => {
+          input.value = data.shifts[input.dataset.slot] || "";
         });
-        await fetch("/api/save", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            date: datePicker.value,
-            shifts: shifts,
-            repos: reposBox.value,
-            changes: changesBox.value
-          })
-        });
+
+        reposBox.value = data.repos || "";
+        changesBox.value = data.changes || "";
+
+      } catch (error) {
+        console.error(error);
+        setBadge("Erreur de chargement", "rose");
+      } finally {
+        loadingData = false;
+      }
+    }
+
+    function setBadge(text, color) {
+      badge.textContent = text;
+      badge.className =
+        `px-2 py-1 text-xs rounded-full bg-${color}-100 text-${color}-700 font-semibold`;
+    }
+
+    // --- Envoi : un champ à la fois ---
+    const timers = {};
+    const pending = {};   // champs en cours de saisie / d'envoi
+
+    function sendField(field, value) {
+      const date = datePicker.value;   // date figée au moment de la saisie
+      const token = {};
+      pending[field] = token;   // jeton unique par saisie
+      clearTimeout(timers[field]);
+
+      timers[field] = setTimeout(async () => {
+        try {
+          const res = await fetch("/api/patch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ date, field, value })
+          });
+          if (!res.ok) throw new Error("Erreur lors de la sauvegarde");
+          setBadge("Connecté", "emerald");
+        } catch (error) {
+          console.error(error);
+          setBadge("Erreur de sauvegarde", "rose");
+        } finally {
+          // Libère le champ seulement si aucune saisie plus récente n'a eu lieu
+          if (pending[field] === token) delete pending[field];
+        }
       }, 350);
     }
 
-    document.addEventListener("input", e => {
-      if (e.target.matches(".slot-input, #repos, #changes")) triggerAutoSave();
+    document.addEventListener("input", event => {
+      if (loadingData) return;
+      const t = event.target;
+
+      if (t.matches(".slot-input")) {
+        sendField(t.dataset.slot, t.value.trim());
+      } else if (t.id === "repos" || t.id === "changes") {
+        sendField(t.id, t.value);
+      }
     });
 
     datePicker.addEventListener("change", loadData);
 
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws`);
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.date === datePicker.value) {
-        document.querySelectorAll(".slot-input").forEach(i => i.value = msg.shifts[i.dataset.slot] || "");
-        reposBox.value = msg.repos || "";
-        changesBox.value = msg.changes || "";
-      }
-    };
+    // --- Réception : on ne touche qu'au champ modifié ---
+    function applyRemote(field, value) {
+      if (pending[field]) return;   // ne pas écraser ce que je suis en train de taper
 
-    loadData();
+      const el =
+        field === "repos" ? reposBox :
+        field === "changes" ? changesBox :
+        document.querySelector(`.slot-input[data-slot="${field}"]`);
+
+      if (el && el.value !== value) el.value = value;
+    }
+
+    function connectWS() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+      ws.onopen = () => {
+        setBadge("Connecté", "emerald");
+        loadData();   // rattrape ce qui a été manqué pendant une coupure
+      };
+
+      ws.onclose = () => {
+        setBadge("Déconnecté", "amber");
+        setTimeout(connectWS, 2000);   // reconnexion automatique
+      };
+
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = event => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.date === datePicker.value) {
+            applyRemote(msg.field, msg.value);
+          }
+        } catch (error) {
+          console.error("Message de synchronisation invalide", error);
+        }
+      };
+    }
+
+    connectWS();
   </script>
 </body>
 </html>
