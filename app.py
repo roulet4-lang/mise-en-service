@@ -1,33 +1,189 @@
-
 import json
-import sqlite3
+import os
 import re
-from typing import List, Dict
+import sqlite3
+from contextlib import asynccontextmanager
+from typing import List
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI()
+# ---------------------------------------------------------------------------
+# Stockage
+#   - DATABASE_URL défini  -> PostgreSQL (ex. Neon) : les données survivent
+#                             aux redémarrages / mises en veille de Render
+#   - sinon                -> SQLite local (développement) : DB_PATH ou services.db
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+SQLITE_PATH = os.getenv("DB_PATH", "services.db")
 
 
-# Initialisation de la base de données SQLite
-def get_db():
-    conn = sqlite3.connect("services.db", check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+class SqliteStore:
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    def _conn(self):
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init(self):
+        conn = self._conn()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_services (
+                    date_str TEXT PRIMARY KEY,
+                    shifts_json TEXT,
+                    repos_text TEXT,
+                    changes_text TEXT
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def close(self):
+        pass
+
+    def get_day(self, date: str) -> dict:
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM daily_services WHERE date_str = ?", (date,)
+            ).fetchone()
+            if row:
+                return {
+                    "shifts": json.loads(row["shifts_json"]),
+                    "repos": row["repos_text"],
+                    "changes": row["changes_text"],
+                }
+            return {"shifts": {}, "repos": "", "changes": ""}
+        finally:
+            conn.close()
+
+    def patch(self, date: str, field: str, value: str):
+        conn = self._conn()
+        try:
+            # Verrou d'écriture : lecture + fusion + écriture atomiques
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM daily_services WHERE date_str = ?", (date,)
+            ).fetchone()
+            shifts = json.loads(row["shifts_json"]) if row else {}
+            repos = row["repos_text"] if row else ""
+            changes = row["changes_text"] if row else ""
+
+            if field == "repos":
+                repos = value
+            elif field == "changes":
+                changes = value
+            elif value.strip():
+                shifts[field] = value.strip()
+            else:
+                shifts.pop(field, None)
+
+            conn.execute("""
+                INSERT INTO daily_services
+                    (date_str, shifts_json, repos_text, changes_text)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date_str) DO UPDATE SET
+                    shifts_json = excluded.shifts_json,
+                    repos_text = excluded.repos_text,
+                    changes_text = excluded.changes_text
+            """, (date, json.dumps(shifts), repos, changes))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
-with get_db() as conn:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_services (
-            date_str TEXT PRIMARY KEY,
-            shifts_json TEXT,
-            repos_text TEXT,
-            changes_text TEXT
+class PostgresStore:
+    def __init__(self, url: str):
+        from psycopg_pool import ConnectionPool
+
+        self.pool = ConnectionPool(
+            url,
+            min_size=1,
+            max_size=5,
+            open=False,
+            check=ConnectionPool.check_connection,  # écarte les connexions coupées
+            max_idle=240,
+            timeout=30,
+            # prepare_threshold=None : compatible avec le pooler Neon (pgbouncer)
+            kwargs={"prepare_threshold": None, "connect_timeout": 20},
         )
-    """)
-    conn.commit()
 
+    def init(self):
+        self.pool.open(wait=True, timeout=60)
+        with self.pool.connection() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_services (
+                    date_str TEXT PRIMARY KEY,
+                    shifts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    repos_text TEXT NOT NULL DEFAULT '',
+                    changes_text TEXT NOT NULL DEFAULT ''
+                )
+            """)
+
+    def close(self):
+        self.pool.close()
+
+    def get_day(self, date: str) -> dict:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT shifts_json, repos_text, changes_text "
+                "FROM daily_services WHERE date_str = %s",
+                (date,),
+            ).fetchone()
+        if row:
+            return {"shifts": row[0], "repos": row[1], "changes": row[2]}
+        return {"shifts": {}, "repos": "", "changes": ""}
+
+    def patch(self, date: str, field: str, value: str):
+        # Chaque modification est UNE requête atomique : pas de lecture-puis-écriture,
+        # donc deux collègues qui modifient des cases différentes ne s'écrasent jamais.
+        with self.pool.connection() as conn:
+            if field in ("repos", "changes"):
+                col = "repos_text" if field == "repos" else "changes_text"
+                conn.execute(
+                    f"INSERT INTO daily_services (date_str, {col}) VALUES (%s, %s) "
+                    f"ON CONFLICT (date_str) DO UPDATE SET {col} = EXCLUDED.{col}",
+                    (date, value),
+                )
+            elif value.strip():
+                v = value.strip()
+                conn.execute(
+                    "INSERT INTO daily_services (date_str, shifts_json) "
+                    "VALUES (%s, jsonb_build_object(%s::text, %s::text)) "
+                    "ON CONFLICT (date_str) DO UPDATE SET shifts_json = "
+                    "daily_services.shifts_json || jsonb_build_object(%s::text, %s::text)",
+                    (date, field, v, field, v),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO daily_services (date_str) VALUES (%s) "
+                    "ON CONFLICT (date_str) DO UPDATE SET shifts_json = "
+                    "daily_services.shifts_json - %s::text",
+                    (date, field),
+                )
+
+
+store = PostgresStore(DATABASE_URL) if DATABASE_URL else SqliteStore(SQLITE_PATH)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await run_in_threadpool(store.init)
+    yield
+    await run_in_threadpool(store.close)
+
+
+app = FastAPI(lifespan=lifespan)
 
 SLOT_RE = re.compile(r"^[A-Z][0-9]{1,2}$")
 
@@ -79,66 +235,19 @@ async def ws_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
 @app.get("/api/day/{date_str}")
 def get_day(date_str: str):
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT * FROM daily_services WHERE date_str = ?",
-            (date_str,)
-        ).fetchone()
-
-        if row:
-            return {
-                "shifts": json.loads(row["shifts_json"]),
-                "repos": row["repos_text"],
-                "changes": row["changes_text"]
-            }
-
-        return {"shifts": {}, "repos": "", "changes": ""}
-    finally:
-        conn.close()
+    return store.get_day(date_str)
 
 
 @app.post("/api/patch")
 async def patch_field(p: FieldPatch):
-    conn = get_db()
-    try:
-        # Verrou d'écriture : lecture + fusion + écriture atomiques
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT * FROM daily_services WHERE date_str = ?", (p.date,)
-        ).fetchone()
-
-        shifts = json.loads(row["shifts_json"]) if row else {}
-        repos = row["repos_text"] if row else ""
-        changes = row["changes_text"] if row else ""
-
-        if p.field == "repos":
-            repos = p.value
-        elif p.field == "changes":
-            changes = p.value
-        elif p.value.strip():
-            shifts[p.field] = p.value.strip()
-        else:
-            shifts.pop(p.field, None)
-
-        conn.execute("""
-            INSERT INTO daily_services
-                (date_str, shifts_json, repos_text, changes_text)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(date_str) DO UPDATE SET
-                shifts_json = excluded.shifts_json,
-                repos_text = excluded.repos_text,
-                changes_text = excluded.changes_text
-        """, (p.date, json.dumps(shifts), repos, changes))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
+    await run_in_threadpool(store.patch, p.date, p.field, p.value)
     # On ne diffuse que le champ modifié
     await manager.broadcast({"date": p.date, "field": p.field, "value": p.value})
     return {"status": "ok"}
